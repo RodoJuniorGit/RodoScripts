@@ -116,10 +116,14 @@ prompt_params() {
   DISK_SIZE="${DISK_SIZE:-20}"
   [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]] && err "Invalid disk size"
 
-  # Static IP
-  read -rp "Static IP (e.g. 10.1.1.15): " STATIC_IP
-  [[ -z "$STATIC_IP" ]] && err "IP is required"
-  [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]] && err "IP must be in 10.1.1.0/24 range"
+  # Static IP (blank = DHCP)
+  read -rp "Static IP [DHCP]: " STATIC_IP
+  if [[ -n "$STATIC_IP" ]]; then
+    [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]] && err "IP must be in 10.1.1.0/24 range"
+    IP_DISPLAY="$STATIC_IP"
+  else
+    IP_DISPLAY="DHCP"
+  fi
 
   # Root password (for console access fallback)
   read -rsp "Root password: " ROOT_PASS
@@ -133,7 +137,7 @@ prompt_params() {
   echo -e "  Cores:    ${CYAN}${CORES}${NC}"
   echo -e "  RAM:      ${CYAN}${RAM} MB${NC}"
   echo -e "  Disk:     ${CYAN}${DISK_SIZE} GB${NC}"
-  echo -e "  IP:       ${CYAN}${STATIC_IP}${NC}"
+  echo -e "  IP:       ${CYAN}${IP_DISPLAY}${NC}"
   echo -e "  Storage:  ${CYAN}${STORAGE}${NC}"
   echo -e "${BOLD}─────────────────────────────────────────────────${NC}\n"
 
@@ -212,10 +216,16 @@ create_vm() {
 
   # Configure cloud-init
   info "Configuring cloud-init..."
+  local ipconfig
+  if [[ -n "$STATIC_IP" ]]; then
+    ipconfig="ip=${STATIC_IP}${CIDR},gw=${GATEWAY}"
+  else
+    ipconfig="ip=dhcp"
+  fi
   qm set "$VMID" \
     --ciuser root \
     --cipassword "$ROOT_PASS" \
-    --ipconfig0 "ip=${STATIC_IP}${CIDR},gw=${GATEWAY}" \
+    --ipconfig0 "$ipconfig" \
     --nameserver "$(echo $DNS | awk '{print $1}')" \
     --searchdomain "" \
     --sshkeys "$SSH_PUBLIC_KEY" \
@@ -229,27 +239,51 @@ create_vm() {
   ok "VM started"
 
   # Wait for VM to come up
-  info "Waiting for ${STATIC_IP} to respond..."
-  local retries=0
-  while ! ping -c 1 -W 1 "$STATIC_IP" &>/dev/null; do
-    retries=$((retries + 1))
-    if [[ $retries -ge 60 ]]; then
-      warn "VM did not respond after 60s. Check console with: qm terminal ${VMID}"
-      break
+  if [[ -n "$STATIC_IP" ]]; then
+    info "Waiting for ${STATIC_IP} to respond..."
+    local retries=0
+    while ! ping -c 1 -W 1 "$STATIC_IP" &>/dev/null; do
+      retries=$((retries + 1))
+      if [[ $retries -ge 60 ]]; then
+        warn "VM did not respond after 60s. Check console with: qm terminal ${VMID}"
+        break
+      fi
+      sleep 1
+    done
+    [[ $retries -lt 60 ]] && ok "VM is online at ${STATIC_IP}"
+  else
+    info "VM is using DHCP. Waiting for qemu-guest-agent to report IP..."
+    local retries=0
+    local vm_ip=""
+    while [[ -z "$vm_ip" ]]; do
+      vm_ip=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null \
+        | grep -oP '"ip-address"\s*:\s*"10\.1\.1\.\d+"' \
+        | head -1 \
+        | grep -oP '10\.1\.1\.\d+' || true)
+      retries=$((retries + 1))
+      if [[ $retries -ge 90 ]]; then
+        warn "Could not detect IP after 90s. Check console with: qm terminal ${VMID}"
+        break
+      fi
+      sleep 1
+    done
+    if [[ -n "$vm_ip" ]]; then
+      STATIC_IP="$vm_ip"
+      ok "VM is online at ${vm_ip} (via DHCP)"
     fi
-    sleep 1
-  done
-  [[ $retries -lt 60 ]] && ok "VM is online at ${STATIC_IP}"
+  fi
 }
 
 # ── Print summary ────────────────────────────────────────────────────────────
 print_summary() {
+  local ssh_target="${STATIC_IP:-<check DHCP lease>}"
+
   echo ""
   echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
   echo -e "${GREEN}  VM Created Successfully${NC}"
   echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
   echo ""
-  echo -e "  SSH:  ${CYAN}ssh -i ${SSH_PRIVATE_KEY} root@${STATIC_IP}${NC}"
+  echo -e "  SSH:  ${CYAN}ssh -i ${SSH_PRIVATE_KEY} root@${ssh_target}${NC}"
   echo ""
   echo -e "${BOLD}── SSH Public Key (for Dokploy) ────────────────${NC}"
   echo ""
