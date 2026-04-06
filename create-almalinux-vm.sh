@@ -50,14 +50,14 @@ get_next_vmid() {
 show_available_ips() {
   local used_ips nmap_output
   # Store full nmap output for device identification
-  nmap_output=$(nmap -sn "${NETWORK}.0/24" 2>/dev/null)
+  nmap_output=$(nmap -sn "${NETWORK}.0/24" 2>/dev/null || true)
 
   used_ips=$(
     {
-      echo "$nmap_output" | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\."
+      echo "$nmap_output" | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\." || true
       for conf in /etc/pve/qemu-server/*.conf /etc/pve/lxc/*.conf; do
         [[ -f "$conf" ]] || continue
-        grep -oP 'ip=(\d+\.){3}\d+' "$conf" 2>/dev/null | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\."
+        grep -oP 'ip=(\d+\.){3}\d+' "$conf" 2>/dev/null | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\." || true
       done
     } | sort -t. -k4 -n | uniq
   )
