@@ -11,7 +11,6 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────────────────────────
 STORAGE="ssd-nvme"
 BRIDGE="vmbr0"
-NETWORK="10.1.1"
 GATEWAY="10.1.1.1"
 DNS="8.8.8.8 8.8.4.4"
 CIDR="/24"
@@ -46,87 +45,6 @@ get_next_vmid() {
   echo "$id"
 }
 
-
-show_available_ips() {
-  local used_ips nmap_output
-  # Store full nmap output for device identification
-  nmap_output=$(nmap -sn "${NETWORK}.0/24" 2>/dev/null || true)
-
-  used_ips=$(
-    {
-      echo "$nmap_output" | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\." || true
-      for conf in /etc/pve/qemu-server/*.conf /etc/pve/lxc/*.conf; do
-        [[ -f "$conf" ]] || continue
-        grep -oP 'ip=(\d+\.){3}\d+' "$conf" 2>/dev/null | grep -oP '(\d+\.){3}\d+' | grep "^${NETWORK}\." || true
-      done
-    } | sort -t. -k4 -n | uniq
-  )
-
-  echo ""
-  echo -e "${BOLD}Used IPs on ${NETWORK}.0/24:${NC}"
-  echo "$used_ips" | while read -r ip; do
-    local label=""
-
-    # Check Proxmox VMs
-    for conf in /etc/pve/qemu-server/*.conf; do
-      [[ -f "$conf" ]] || continue
-      if grep -q "$ip" "$conf" 2>/dev/null; then
-        local vmname vmid
-        vmname=$(grep -oP '(?<=name: ).*' "$conf" 2>/dev/null || true)
-        vmid=$(basename "$conf" .conf)
-        label="VM ${vmid} (${vmname:-unknown})"
-        break
-      fi
-    done
-
-    # Check Proxmox CTs
-    if [[ -z "$label" ]]; then
-      for conf in /etc/pve/lxc/*.conf; do
-        [[ -f "$conf" ]] || continue
-        if grep -q "$ip" "$conf" 2>/dev/null; then
-          local ctname ctid
-          ctname=$(grep -oP '(?<=hostname: ).*' "$conf" 2>/dev/null || true)
-          ctid=$(basename "$conf" .conf)
-          label="CT ${ctid} (${ctname:-unknown})"
-          break
-        fi
-      done
-    fi
-
-    # Check known hosts
-    if [[ -z "$label" ]]; then
-      [[ "$ip" == "$GATEWAY" ]] && label="Gateway"
-      [[ "$ip" == "10.1.1.120" ]] && label="Proxmox Host"
-    fi
-
-    # Fall back to MAC vendor from nmap output
-    if [[ -z "$label" ]]; then
-      local mac_line
-      mac_line=$(echo "$nmap_output" | grep -A1 "$ip" | grep "MAC Address" | sed 's/.*(\(.*\))/\1/' || true)
-      label="${mac_line:-unknown device}"
-    fi
-
-    echo -e "  ${RED}${ip}${NC} → ${label}"
-  done
-
-  # Suggest free IPs
-  echo ""
-  echo -e "${BOLD}Suggested available IPs:${NC}"
-  local count=0
-  for i in $(seq 2 254); do
-    local candidate="${NETWORK}.${i}"
-    [[ "$candidate" == "$GATEWAY" ]] && continue
-    [[ "$candidate" == "${NETWORK}.255" ]] && continue
-    [[ "$candidate" == "10.1.1.120" ]] && continue
-    if ! echo "$used_ips" | grep -q "^${candidate}$"; then
-      echo -e "  ${GREEN}${candidate}${NC}"
-      count=$((count + 1))
-      [[ $count -ge 5 ]] && break
-    fi
-  done
-  echo ""
-}
-
 # ── Generate SSH key pair ─────────────────────────────────────────────────────
 generate_ssh_key() {
   local hostname="$1"
@@ -148,18 +66,11 @@ generate_ssh_key() {
 
 # ── Ensure dependencies ───────────────────────────────────────────────────────
 ensure_deps() {
-  local need_update=false
   if ! command -v virt-customize &>/dev/null; then
-    need_update=true
-  fi
-  if ! command -v nmap &>/dev/null; then
-    need_update=true
-  fi
-  if $need_update; then
-    info "Installing dependencies..."
+    info "Installing libguestfs-tools..."
     apt-get -qq update >/dev/null 2>&1
-    apt-get -qq install -y libguestfs-tools nmap >/dev/null 2>&1
-    ok "Installed dependencies"
+    apt-get -qq install -y libguestfs-tools >/dev/null 2>&1
+    ok "Installed libguestfs-tools"
   fi
 }
 
@@ -205,8 +116,7 @@ prompt_params() {
   DISK_SIZE="${DISK_SIZE:-20}"
   [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]] && err "Invalid disk size"
 
-  # IP selection
-  show_available_ips
+  # Static IP
   read -rp "Static IP (e.g. 10.1.1.15): " STATIC_IP
   [[ -z "$STATIC_IP" ]] && err "IP is required"
   [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]] && err "IP must be in 10.1.1.0/24 range"
