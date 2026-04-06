@@ -225,6 +225,18 @@ create_vm() {
   else
     ipconfig="ip=dhcp"
   fi
+
+  # Create cloud-init vendor snippet to install qemu-guest-agent
+  local snippets_dir="/var/lib/vz/snippets"
+  mkdir -p "$snippets_dir"
+  cat > "${snippets_dir}/vm-${VMID}-vendor.yaml" <<'VENDOREOF'
+#cloud-config
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+VENDOREOF
+
   qm set "$VMID" \
     --ciuser root \
     --cipassword "$ROOT_PASS" \
@@ -232,7 +244,8 @@ create_vm() {
     --nameserver "$(echo $DNS | awk '{print $1}')" \
     --searchdomain "" \
     --sshkeys "$SSH_PUBLIC_KEY" \
-    --ciupgrade 0 >/dev/null
+    --ciupgrade 0 \
+    --cicustom "vendor=local:snippets/vm-${VMID}-vendor.yaml" >/dev/null
 
   ok "Created VM ${VMID} (${HN})"
 
@@ -288,12 +301,17 @@ print_summary() {
   echo ""
   echo -e "  SSH:  ${CYAN}ssh -i ${SSH_PRIVATE_KEY} root@${ssh_target}${NC}"
   echo ""
-  echo -e "${BOLD}── SSH Public Key (for Dokploy) ────────────────${NC}"
+  echo -e "${BOLD}── SSH Private Key (for Dokploy) ───────────────${NC}"
+  echo ""
+  cat "$SSH_PRIVATE_KEY"
+  echo ""
+  echo -e "${BOLD}── SSH Public Key ──────────────────────────────${NC}"
   echo ""
   cat "$SSH_PUBLIC_KEY"
   echo ""
-  echo -e "${BOLD}── SSH Private Key Path ────────────────────────${NC}"
-  echo -e "  ${SSH_PRIVATE_KEY}"
+  echo -e "${BOLD}── Key Paths ──────────────────────────────────${NC}"
+  echo -e "  Private: ${SSH_PRIVATE_KEY}"
+  echo -e "  Public:  ${SSH_PUBLIC_KEY}"
   echo ""
   echo -e "${BOLD}─────────────────────────────────────────────────${NC}"
 }
