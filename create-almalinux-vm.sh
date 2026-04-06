@@ -14,6 +14,7 @@ BRIDGE="vmbr0"
 GATEWAY="10.1.1.1"
 DNS="8.8.8.8 8.8.4.4"
 CIDR="/24"
+STATIC_IP=""
 IMAGE_URL="https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
 IMAGE_DIR="/var/lib/vz/template/iso"
 IMAGE_FILE="AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
@@ -33,7 +34,7 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # ── Root check ────────────────────────────────────────────────────────────────
-[[ "$(id -u)" -ne 0 ]] && err "Run as root."
+if [[ "$(id -u)" -ne 0 ]]; then err "Run as root."; fi
 
 # ── Get next available VMID ───────────────────────────────────────────────────
 get_next_vmid() {
@@ -104,22 +105,22 @@ prompt_params() {
   # CPU Cores
   read -rp "CPU Cores [2]: " CORES
   CORES="${CORES:-2}"
-  [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]] && err "Invalid core count"
+  if [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]]; then err "Invalid core count"; fi
 
   # RAM
   read -rp "RAM in MB [2048]: " RAM
   RAM="${RAM:-2048}"
-  [[ ! "$RAM" =~ ^[1-9][0-9]*$ ]] && err "Invalid RAM size"
+  if [[ ! "$RAM" =~ ^[1-9][0-9]*$ ]]; then err "Invalid RAM size"; fi
 
   # Disk size
   read -rp "Disk size in GB [20]: " DISK_SIZE
   DISK_SIZE="${DISK_SIZE:-20}"
-  [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]] && err "Invalid disk size"
+  if [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]]; then err "Invalid disk size"; fi
 
   # Static IP (blank = DHCP)
   read -rp "Static IP [DHCP]: " STATIC_IP
   if [[ -n "$STATIC_IP" ]]; then
-    [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]] && err "IP must be in 10.1.1.0/24 range"
+    if [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]]; then err "IP must be in 10.1.1.0/24 range"; fi
     IP_DISPLAY="$STATIC_IP"
   else
     IP_DISPLAY="DHCP"
@@ -128,7 +129,7 @@ prompt_params() {
   # Root password (for console access fallback)
   read -rsp "Root password: " ROOT_PASS
   echo ""
-  [[ -z "$ROOT_PASS" ]] && err "Password is required"
+  if [[ -z "$ROOT_PASS" ]]; then err "Password is required"; fi
 
   # Confirm
   echo -e "\n${BOLD}── Summary ─────────────────────────────────────${NC}"
@@ -142,7 +143,9 @@ prompt_params() {
   echo -e "${BOLD}─────────────────────────────────────────────────${NC}\n"
 
   read -rp "Proceed? [Y/n]: " CONFIRM
-  [[ "${CONFIRM,,}" == "n" ]] && exit 0
+  if [[ "${CONFIRM,,}" == "n" ]]; then
+    exit 0
+  fi
 }
 
 # ── Create the VM ─────────────────────────────────────────────────────────────
@@ -250,7 +253,7 @@ create_vm() {
       fi
       sleep 1
     done
-    [[ $retries -lt 60 ]] && ok "VM is online at ${STATIC_IP}"
+    if [[ $retries -lt 60 ]]; then ok "VM is online at ${STATIC_IP}"; fi
   else
     info "VM is using DHCP. Waiting for qemu-guest-agent to report IP..."
     local retries=0
