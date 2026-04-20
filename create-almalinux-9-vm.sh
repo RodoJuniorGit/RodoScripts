@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# AlmaLinux 10 VM Creator for Proxmox
+# AlmaLinux 9 VM Creator for Proxmox
 # Creates a q35/OVMF VM with cloud-init, SSH key, and static IP
-# Storage: ssd-nvme (LVM)
 # Network: 10.1.1.0/24 via vmbr0
 # =============================================================================
 
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-STORAGE="ssd-nvme"
+STORAGE=""
 BRIDGE="vmbr0"
 GATEWAY="10.1.1.1"
 DNS="8.8.8.8 8.8.4.4"
@@ -57,7 +56,7 @@ generate_ssh_key() {
   if [[ -f "${key_path}" ]]; then
     warn "SSH key already exists at ${key_path}, reusing it."
   else
-    ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "proxmox-${hostname}" 
+    ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "proxmox-${hostname}"
     ok "Generated SSH key pair at ${key_path}"
   fi
 
@@ -67,11 +66,15 @@ generate_ssh_key() {
 
 # ── Ensure dependencies ───────────────────────────────────────────────────────
 ensure_deps() {
-  if ! command -v virt-customize &>/dev/null; then
-    info "Installing libguestfs-tools..."
-    apt-get -qq update 
-    apt-get -qq install -y libguestfs-tools 
-    ok "Installed libguestfs-tools"
+  local missing=()
+  command -v virt-customize &>/dev/null || missing+=("libguestfs-tools")
+  command -v jq &>/dev/null || missing+=("jq")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    info "Installing missing dependencies: ${missing[*]}"
+    apt-get -qq update
+    apt-get -qq install -y "${missing[@]}"
+    ok "Installed dependencies"
   fi
 }
 
@@ -81,10 +84,87 @@ download_image() {
   if [[ -f "${IMAGE_DIR}/${IMAGE_FILE}" ]]; then
     ok "Image already cached at ${IMAGE_DIR}/${IMAGE_FILE}"
   else
-    info "Downloading AlmaLinux 10 cloud image..."
+    info "Downloading AlmaLinux 9 cloud image..."
     curl -fSL -o "${IMAGE_DIR}/${IMAGE_FILE}" "$IMAGE_URL"
     ok "Downloaded image"
   fi
+}
+
+# ── Prompt for storage selection ─────────────────────────────────────────────
+prompt_storage() {
+  info "Detecting available storages..."
+
+  # Get storages from /storage config (has content types) and enrich with
+  # runtime info from pvesm status (for free space + active state).
+  local storages_json
+  storages_json=$(pvesh get /storage --output-format json 2>/dev/null)
+
+  # Filter: only storages that support 'images' content type, and are not disabled
+  mapfile -t storage_list < <(echo "$storages_json" \
+    | jq -r '.[] | select((.content // "") | split(",") | index("images")) | select((.disable // 0) != 1) | "\(.storage)|\(.type)"')
+
+  if [[ ${#storage_list[@]} -eq 0 ]]; then
+    err "No storage with 'images' content type found."
+  fi
+
+  # Build pvesm status map for free space (only active storages appear here)
+  declare -A avail_map
+  declare -A active_map
+  while read -r line; do
+    local sid stype status avail_kib
+    sid=$(echo "$line" | awk '{print $1}')
+    status=$(echo "$line" | awk '{print $3}')
+    avail_kib=$(echo "$line" | awk '{print $5}')
+    avail_map["$sid"]="$avail_kib"
+    active_map["$sid"]="$status"
+  done < <(pvesm status 2>/dev/null | tail -n +2)
+
+  echo -e "\n${BOLD}── Available Storages ──────────────────────────${NC}"
+  local i=1
+  declare -gA storage_map
+  declare -gA storage_type_map
+  for entry in "${storage_list[@]}"; do
+    local sid="${entry%%|*}"
+    local stype="${entry##*|}"
+    local avail_kib="${avail_map[$sid]:-0}"
+    local status="${active_map[$sid]:-inactive}"
+    local avail_gb="?"
+    if [[ "$avail_kib" =~ ^[0-9]+$ ]]; then
+      avail_gb=$(( avail_kib / 1024 / 1024 ))
+    fi
+    local status_color="${GREEN}"
+    [[ "$status" != "active" ]] && status_color="${RED}"
+    printf "  ${CYAN}%d)${NC} %-18s ${YELLOW}%-12s${NC} ${status_color}%-8s${NC} ${GREEN}%s GB free${NC}\n" \
+      "$i" "$sid" "$stype" "$status" "$avail_gb"
+    storage_map[$i]="$sid"
+    storage_type_map[$i]="$stype"
+    i=$((i + 1))
+  done
+  echo ""
+
+  local choice
+  while true; do
+    read -rp "Select storage [1-$((i-1))]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ -n "${storage_map[$choice]:-}" ]]; then
+      STORAGE="${storage_map[$choice]}"
+      local selected_type="${storage_type_map[$choice]}"
+      # Warn if storage type might not support the LVM-style disk allocation
+      case "$selected_type" in
+        lvmthin|lvm|zfspool|rbd|cephfs)
+          ok "Selected storage: ${STORAGE} (${selected_type})"
+          ;;
+        *)
+          warn "Storage type '${selected_type}' may not fully support this script's disk allocation flow."
+          warn "This script was designed for LVM-thin/LVM/ZFS/RBD storages."
+          read -rp "Continue anyway? [y/N]: " cont
+          if [[ "${cont,,}" != "y" ]]; then continue; fi
+          ok "Selected storage: ${STORAGE} (${selected_type})"
+          ;;
+      esac
+      break
+    fi
+    warn "Invalid choice."
+  done
 }
 
 # ── Prompt for parameters ────────────────────────────────────────────────────
@@ -92,10 +172,12 @@ prompt_params() {
   VMID=$(get_next_vmid)
 
   echo -e "\n${BOLD}═══════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}  AlmaLinux 10 VM Creator${NC}"
+  echo -e "${BOLD}  AlmaLinux 9 VM Creator${NC}"
   echo -e "${BOLD}═══════════════════════════════════════════════${NC}\n"
 
   echo -e "Next available VMID: ${CYAN}${VMID}${NC}\n"
+
+  prompt_storage
 
   # Hostname
   read -rp "Hostname [almalinux]: " HN
@@ -162,14 +244,14 @@ create_vm() {
   cp "${IMAGE_DIR}/${IMAGE_FILE}" "$work_file"
 
   info "Customizing image..."
-  virt-customize -q -a "$work_file" --hostname "$HN" 
-  virt-customize -q -a "$work_file" --run-command "truncate -s 0 /etc/machine-id" 
-  virt-customize -q -a "$work_file" --run-command "rm -f /var/lib/dbus/machine-id" 
-  virt-customize -q -a "$work_file" --run-command "systemctl disable systemd-firstboot.service 2>/dev/null; ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service"  || true
-  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"  || true
-  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"  || true
-  virt-customize -q -a "$work_file" --run-command "systemctl enable serial-getty@ttyS0.service"  || true
-  virt-customize -q -a "$work_file" --selinux-relabel  || true
+  virt-customize -q -a "$work_file" --hostname "$HN"
+  virt-customize -q -a "$work_file" --run-command "truncate -s 0 /etc/machine-id"
+  virt-customize -q -a "$work_file" --run-command "rm -f /var/lib/dbus/machine-id"
+  virt-customize -q -a "$work_file" --run-command "systemctl disable systemd-firstboot.service 2>/dev/null; ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service" || true
+  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config" || true
+  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config" || true
+  virt-customize -q -a "$work_file" --run-command "systemctl enable serial-getty@ttyS0.service" || true
+  virt-customize -q -a "$work_file" --selinux-relabel || true
   ok "Image customized"
 
   info "Converting to raw format (required for LVM)..."

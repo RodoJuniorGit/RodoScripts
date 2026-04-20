@@ -2,22 +2,22 @@
 # =============================================================================
 # AlmaLinux 10 VM Creator for Proxmox
 # Creates a q35/OVMF VM with cloud-init, SSH key, and static IP
-# Storage: ssd-nvme (LVM)
 # Network: 10.1.1.0/24 via vmbr0
+# Requires CPU with x86-64-v3 support (AVX2, BMI2, etc)
 # =============================================================================
 
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-STORAGE="ssd-nvme"
+STORAGE=""
 BRIDGE="vmbr0"
 GATEWAY="10.1.1.1"
 DNS="8.8.8.8 8.8.4.4"
 CIDR="/24"
 STATIC_IP=""
 IMAGE_URL="https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
-IMAGE_DIR="/var/lib/vz/template/iso"
 IMAGE_FILE="AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
+IMAGE_DIR="/var/lib/vz/template/iso"
 SSH_KEY_DIR="/root/.ssh/proxmox-vm-keys"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -35,6 +35,19 @@ err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then err "Run as root."; fi
+
+# ── CPU capability check ──────────────────────────────────────────────────────
+check_cpu_v3() {
+  local required_flags=("avx2" "bmi1" "bmi2" "fma" "movbe")
+  local cpu_flags
+  cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2)
+  for flag in "${required_flags[@]}"; do
+    if ! echo "$cpu_flags" | grep -qw "$flag"; then
+      err "CPU does not support x86-64-v3 (missing: $flag). AlmaLinux 10 will not boot on this host. Use the AlmaLinux 9 script instead."
+    fi
+  done
+  ok "CPU supports x86-64-v3"
+}
 
 # ── Get next available VMID ───────────────────────────────────────────────────
 get_next_vmid() {
@@ -57,7 +70,7 @@ generate_ssh_key() {
   if [[ -f "${key_path}" ]]; then
     warn "SSH key already exists at ${key_path}, reusing it."
   else
-    ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "proxmox-${hostname}" >/dev/null 2>&1
+    ssh-keygen -t ed25519 -f "${key_path}" -N "" -C "proxmox-${hostname}"
     ok "Generated SSH key pair at ${key_path}"
   fi
 
@@ -67,11 +80,15 @@ generate_ssh_key() {
 
 # ── Ensure dependencies ───────────────────────────────────────────────────────
 ensure_deps() {
-  if ! command -v virt-customize &>/dev/null; then
-    info "Installing libguestfs-tools..."
-    apt-get -qq update >/dev/null 2>&1
-    apt-get -qq install -y libguestfs-tools >/dev/null 2>&1
-    ok "Installed libguestfs-tools"
+  local missing=()
+  command -v virt-customize &>/dev/null || missing+=("libguestfs-tools")
+  command -v jq &>/dev/null || missing+=("jq")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    info "Installing missing dependencies: ${missing[*]}"
+    apt-get -qq update
+    apt-get -qq install -y "${missing[@]}"
+    ok "Installed dependencies"
   fi
 }
 
@@ -87,6 +104,78 @@ download_image() {
   fi
 }
 
+# ── Prompt for storage selection ─────────────────────────────────────────────
+prompt_storage() {
+  info "Detecting available storages..."
+
+  local storages_json
+  storages_json=$(pvesh get /storage --output-format json 2>/dev/null)
+
+  mapfile -t storage_list < <(echo "$storages_json" \
+    | jq -r '.[] | select((.content // "") | split(",") | index("images")) | select((.disable // 0) != 1) | "\(.storage)|\(.type)"')
+
+  if [[ ${#storage_list[@]} -eq 0 ]]; then
+    err "No storage with 'images' content type found."
+  fi
+
+  declare -A avail_map
+  declare -A active_map
+  while read -r line; do
+    local sid status avail_kib
+    sid=$(echo "$line" | awk '{print $1}')
+    status=$(echo "$line" | awk '{print $3}')
+    avail_kib=$(echo "$line" | awk '{print $5}')
+    avail_map["$sid"]="$avail_kib"
+    active_map["$sid"]="$status"
+  done < <(pvesm status 2>/dev/null | tail -n +2)
+
+  echo -e "\n${BOLD}── Available Storages ──────────────────────────${NC}"
+  local i=1
+  declare -gA storage_map
+  declare -gA storage_type_map
+  for entry in "${storage_list[@]}"; do
+    local sid="${entry%%|*}"
+    local stype="${entry##*|}"
+    local avail_kib="${avail_map[$sid]:-0}"
+    local status="${active_map[$sid]:-inactive}"
+    local avail_gb="?"
+    if [[ "$avail_kib" =~ ^[0-9]+$ ]]; then
+      avail_gb=$(( avail_kib / 1024 / 1024 ))
+    fi
+    local status_color="${GREEN}"
+    [[ "$status" != "active" ]] && status_color="${RED}"
+    printf "  ${CYAN}%d)${NC} %-18s ${YELLOW}%-12s${NC} ${status_color}%-8s${NC} ${GREEN}%s GB free${NC}\n" \
+      "$i" "$sid" "$stype" "$status" "$avail_gb"
+    storage_map[$i]="$sid"
+    storage_type_map[$i]="$stype"
+    i=$((i + 1))
+  done
+  echo ""
+
+  local choice
+  while true; do
+    read -rp "Select storage [1-$((i-1))]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ -n "${storage_map[$choice]:-}" ]]; then
+      STORAGE="${storage_map[$choice]}"
+      local selected_type="${storage_type_map[$choice]}"
+      case "$selected_type" in
+        lvmthin|lvm|zfspool|rbd|cephfs)
+          ok "Selected storage: ${STORAGE} (${selected_type})"
+          ;;
+        *)
+          warn "Storage type '${selected_type}' may not fully support this script's disk allocation flow."
+          warn "This script was designed for LVM-thin/LVM/ZFS/RBD storages."
+          read -rp "Continue anyway? [y/N]: " cont
+          if [[ "${cont,,}" != "y" ]]; then continue; fi
+          ok "Selected storage: ${STORAGE} (${selected_type})"
+          ;;
+      esac
+      break
+    fi
+    warn "Invalid choice."
+  done
+}
+
 # ── Prompt for parameters ────────────────────────────────────────────────────
 prompt_params() {
   VMID=$(get_next_vmid)
@@ -97,27 +186,24 @@ prompt_params() {
 
   echo -e "Next available VMID: ${CYAN}${VMID}${NC}\n"
 
-  # Hostname
+  prompt_storage
+
   read -rp "Hostname [almalinux]: " HN
   HN="${HN:-almalinux}"
   HN=$(echo "${HN,,}" | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
 
-  # CPU Cores
   read -rp "CPU Cores [2]: " CORES
   CORES="${CORES:-2}"
   if [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]]; then err "Invalid core count"; fi
 
-  # RAM
   read -rp "RAM in MB [2048]: " RAM
   RAM="${RAM:-2048}"
   if [[ ! "$RAM" =~ ^[1-9][0-9]*$ ]]; then err "Invalid RAM size"; fi
 
-  # Disk size
   read -rp "Disk size in GB [20]: " DISK_SIZE
   DISK_SIZE="${DISK_SIZE:-20}"
   if [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]]; then err "Invalid disk size"; fi
 
-  # Static IP (blank = DHCP)
   read -rp "Static IP [DHCP]: " STATIC_IP
   if [[ -n "$STATIC_IP" ]]; then
     if [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]]; then err "IP must be in 10.1.1.0/24 range"; fi
@@ -126,12 +212,10 @@ prompt_params() {
     IP_DISPLAY="DHCP"
   fi
 
-  # Root password (for console access fallback)
   read -rsp "Root password: " ROOT_PASS
   echo ""
   if [[ -z "$ROOT_PASS" ]]; then err "Password is required"; fi
 
-  # Confirm
   echo -e "\n${BOLD}── Summary ─────────────────────────────────────${NC}"
   echo -e "  VMID:     ${CYAN}${VMID}${NC}"
   echo -e "  Hostname: ${CYAN}${HN}${NC}"
@@ -162,14 +246,14 @@ create_vm() {
   cp "${IMAGE_DIR}/${IMAGE_FILE}" "$work_file"
 
   info "Customizing image..."
-  virt-customize -q -a "$work_file" --hostname "$HN" >/dev/null 2>&1
-  virt-customize -q -a "$work_file" --run-command "truncate -s 0 /etc/machine-id" >/dev/null 2>&1
-  virt-customize -q -a "$work_file" --run-command "rm -f /var/lib/dbus/machine-id" >/dev/null 2>&1
-  virt-customize -q -a "$work_file" --run-command "systemctl disable systemd-firstboot.service 2>/dev/null; ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service" >/dev/null 2>&1 || true
-  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config" >/dev/null 2>&1 || true
-  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config" >/dev/null 2>&1 || true
-  virt-customize -q -a "$work_file" --run-command "systemctl enable serial-getty@ttyS0.service" >/dev/null 2>&1 || true
-  virt-customize -q -a "$work_file" --selinux-relabel >/dev/null 2>&1 || true
+  virt-customize -q -a "$work_file" --hostname "$HN"
+  virt-customize -q -a "$work_file" --run-command "truncate -s 0 /etc/machine-id"
+  virt-customize -q -a "$work_file" --run-command "rm -f /var/lib/dbus/machine-id"
+  virt-customize -q -a "$work_file" --run-command "systemctl disable systemd-firstboot.service 2>/dev/null; ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service" || true
+  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config" || true
+  virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config" || true
+  virt-customize -q -a "$work_file" --run-command "systemctl enable serial-getty@ttyS0.service" || true
+  virt-customize -q -a "$work_file" --selinux-relabel || true
   ok "Image customized"
 
   info "Converting to raw format (required for LVM)..."
@@ -195,16 +279,13 @@ create_vm() {
     -ostype l26 \
     -scsihw virtio-scsi-pci
 
-  # Allocate EFI and TPM disks
   pvesm alloc "$STORAGE" "$VMID" "vm-${VMID}-disk-0" 4M >/dev/null
   pvesm alloc "$STORAGE" "$VMID" "vm-${VMID}-disk-2" 4M >/dev/null
 
-  # Import the OS disk
   info "Importing disk image..."
   qm importdisk "$VMID" "$raw_file" "$STORAGE" -format raw >/dev/null
   rm -f "$raw_file"
 
-  # Configure disks and boot
   qm set "$VMID" \
     -efidisk0 "${STORAGE}:vm-${VMID}-disk-0" \
     -scsi0 "${STORAGE}:vm-${VMID}-disk-1,discard=on,ssd=1" \
@@ -213,11 +294,9 @@ create_vm() {
     -boot order=scsi0 \
     -serial0 socket >/dev/null
 
-  # Resize disk
   info "Resizing disk to ${DISK_SIZE}G..."
   qm resize "$VMID" scsi0 "${DISK_SIZE}G" >/dev/null
 
-  # Configure cloud-init
   info "Configuring cloud-init..."
   local ipconfig
   if [[ -n "$STATIC_IP" ]]; then
@@ -226,7 +305,6 @@ create_vm() {
     ipconfig="ip=dhcp"
   fi
 
-  # Create cloud-init vendor snippet to install qemu-guest-agent
   local snippets_dir="/var/lib/vz/snippets"
   mkdir -p "$snippets_dir"
   cat > "${snippets_dir}/vm-${VMID}-vendor.yaml" <<'VENDOREOF'
@@ -249,12 +327,10 @@ VENDOREOF
 
   ok "Created VM ${VMID} (${HN})"
 
-  # Start the VM
   info "Starting VM..."
   qm start "$VMID"
   ok "VM started"
 
-  # Wait for VM to come up
   if [[ -n "$STATIC_IP" ]]; then
     info "Waiting for ${STATIC_IP} to respond..."
     local retries=0
@@ -317,6 +393,7 @@ print_summary() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+check_cpu_v3
 ensure_deps
 download_image
 prompt_params
