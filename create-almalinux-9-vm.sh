@@ -268,7 +268,7 @@ create_vm() {
     -tablet 0 \
     -localtime 1 \
     -bios ovmf \
-    -cpu x86-64-v2-AES \
+    -cpu x86-64-v2 \
     -cores "$CORES" \
     -memory "$RAM" \
     -name "$HN" \
