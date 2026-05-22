@@ -35,6 +35,19 @@ err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # ── Root check ────────────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then err "Run as root."; fi
 
+# ── Make xterm.js the default web console (datacenter-wide) ───────────────────
+ensure_xterm_default() {
+  local cfg="/etc/pve/datacenter.cfg"
+  [[ -f "$cfg" ]] || : > "$cfg"
+  if grep -qE '^console:' "$cfg"; then
+    grep -qE '^console:[[:space:]]*xtermjs[[:space:]]*$' "$cfg" && return
+    sed -i 's/^console:.*/console: xtermjs/' "$cfg"
+  else
+    printf 'console: xtermjs\n' >> "$cfg"
+  fi
+  ok "Default web console viewer set to xterm.js"
+}
+
 # ── Get next available VMID ───────────────────────────────────────────────────
 get_next_vmid() {
   local id
@@ -275,8 +288,7 @@ create_vm() {
     -net0 "virtio,bridge=${BRIDGE},macaddr=${mac}" \
     -onboot 1 \
     -ostype l26 \
-    -scsihw virtio-scsi-pci \
-    -vga serial0
+    -scsihw virtio-scsi-pci
 
   # Allocate EFI and TPM disks
   pvesm alloc "$STORAGE" "$VMID" "vm-${VMID}-disk-0" 4M >/dev/null
@@ -401,6 +413,7 @@ print_summary() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 ensure_deps
+ensure_xterm_default
 download_image
 prompt_params
 create_vm
