@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # AlmaLinux 10 VM Creator for Proxmox
-# Creates a q35/OVMF VM with cloud-init, SSH key, and static IP
+# Creates a q35/OVMF VM with SSH key and static IP (no cloud-init)
 # Network: 10.1.1.0/24 via vmbr0
 # Requires CPU with x86-64-v3 support (AVX2, BMI2, etc)
 # =============================================================================
@@ -204,13 +204,10 @@ prompt_params() {
   DISK_SIZE="${DISK_SIZE:-20}"
   if [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]*$ ]]; then err "Invalid disk size"; fi
 
-  read -rp "Static IP [DHCP]: " STATIC_IP
-  if [[ -n "$STATIC_IP" ]]; then
-    if [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]]; then err "IP must be in 10.1.1.0/24 range"; fi
-    IP_DISPLAY="$STATIC_IP"
-  else
-    IP_DISPLAY="DHCP"
-  fi
+  read -rp "Static IP (10.1.1.x): " STATIC_IP
+  if [[ -z "$STATIC_IP" ]]; then err "Static IP is required"; fi
+  if [[ ! "$STATIC_IP" =~ ^10\.1\.1\.[0-9]+$ ]]; then err "IP must be in 10.1.1.0/24 range"; fi
+  IP_DISPLAY="$STATIC_IP"
 
   read -rsp "Root password: " ROOT_PASS
   echo ""
@@ -245,14 +242,46 @@ create_vm() {
   work_file=$(mktemp --suffix=.qcow2)
   cp "${IMAGE_DIR}/${IMAGE_FILE}" "$work_file"
 
+  info "Building static network connection..."
+  local nm_tmp dns_nm
+  nm_tmp=$(mktemp -d)
+  dns_nm=$(echo "$DNS" | tr ' ' ';')
+  cat > "${nm_tmp}/rodo-static.nmconnection" <<NMEOF
+[connection]
+id=rodo-static
+type=ethernet
+autoconnect=true
+
+[ipv4]
+method=manual
+address1=${STATIC_IP}${CIDR},${GATEWAY}
+dns=${dns_nm};
+
+[ipv6]
+method=disabled
+NMEOF
+
   info "Customizing image..."
   virt-customize -q -a "$work_file" --hostname "$HN"
+  virt-customize -q -a "$work_file" --root-password "password:${ROOT_PASS}"
+  virt-customize -q -a "$work_file" --ssh-inject "root:file:${SSH_PUBLIC_KEY}"
   virt-customize -q -a "$work_file" --run-command "truncate -s 0 /etc/machine-id"
   virt-customize -q -a "$work_file" --run-command "rm -f /var/lib/dbus/machine-id"
   virt-customize -q -a "$work_file" --run-command "systemctl disable systemd-firstboot.service 2>/dev/null; ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service" || true
   virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config" || true
   virt-customize -q -a "$work_file" --run-command "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config" || true
   virt-customize -q -a "$work_file" --run-command "systemctl enable serial-getty@ttyS0.service" || true
+  # Disable cloud-init entirely; network is baked in below
+  virt-customize -q -a "$work_file" --run-command "touch /etc/cloud/cloud-init.disabled" || true
+  # Install and enable the guest agent (was previously done by cloud-init at boot)
+  virt-customize -q -a "$work_file" --install qemu-guest-agent
+  virt-customize -q -a "$work_file" --run-command "systemctl enable qemu-guest-agent" || true
+  # Inject the static NetworkManager connection
+  virt-customize -q -a "$work_file" \
+    --copy-in "${nm_tmp}/rodo-static.nmconnection:/etc/NetworkManager/system-connections/" \
+    --run-command "chown root:root /etc/NetworkManager/system-connections/rodo-static.nmconnection" \
+    --run-command "chmod 600 /etc/NetworkManager/system-connections/rodo-static.nmconnection"
+  rm -rf "$nm_tmp"
   virt-customize -q -a "$work_file" --selinux-relabel || true
   ok "Image customized"
 
@@ -289,7 +318,6 @@ create_vm() {
   qm set "$VMID" \
     -efidisk0 "${STORAGE}:vm-${VMID}-disk-0" \
     -scsi0 "${STORAGE}:vm-${VMID}-disk-1,discard=on,ssd=1" \
-    -scsi1 "${STORAGE}:cloudinit" \
     -tpmstate0 "${STORAGE}:vm-${VMID}-disk-2,version=v2.0" \
     -boot order=scsi0 \
     -serial0 socket >/dev/null
@@ -297,73 +325,23 @@ create_vm() {
   info "Resizing disk to ${DISK_SIZE}G..."
   qm resize "$VMID" scsi0 "${DISK_SIZE}G" >/dev/null
 
-  info "Configuring cloud-init..."
-  local ipconfig
-  if [[ -n "$STATIC_IP" ]]; then
-    ipconfig="ip=${STATIC_IP}${CIDR},gw=${GATEWAY}"
-  else
-    ipconfig="ip=dhcp"
-  fi
-
-  local snippets_dir="/var/lib/vz/snippets"
-  mkdir -p "$snippets_dir"
-  cat > "${snippets_dir}/vm-${VMID}-vendor.yaml" <<'VENDOREOF'
-#cloud-config
-packages:
-  - qemu-guest-agent
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-VENDOREOF
-
-  qm set "$VMID" \
-    --ciuser root \
-    --cipassword "$ROOT_PASS" \
-    --ipconfig0 "$ipconfig" \
-    --nameserver "$(echo $DNS | awk '{print $1}')" \
-    --searchdomain "" \
-    --sshkeys "$SSH_PUBLIC_KEY" \
-    --ciupgrade 0 \
-    --cicustom "vendor=local:snippets/vm-${VMID}-vendor.yaml" >/dev/null
-
   ok "Created VM ${VMID} (${HN})"
 
   info "Starting VM..."
   qm start "$VMID"
   ok "VM started"
 
-  if [[ -n "$STATIC_IP" ]]; then
-    info "Waiting for ${STATIC_IP} to respond..."
-    local retries=0
-    while ! ping -c 1 -W 1 "$STATIC_IP" &>/dev/null; do
-      retries=$((retries + 1))
-      if [[ $retries -ge 60 ]]; then
-        warn "VM did not respond after 60s. Check console with: qm terminal ${VMID}"
-        break
-      fi
-      sleep 1
-    done
-    if [[ $retries -lt 60 ]]; then ok "VM is online at ${STATIC_IP}"; fi
-  else
-    info "VM is using DHCP. Waiting for qemu-guest-agent to report IP..."
-    local retries=0
-    local vm_ip=""
-    while [[ -z "$vm_ip" ]]; do
-      vm_ip=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null \
-        | grep -oP '"ip-address"\s*:\s*"10\.1\.1\.\d+"' \
-        | head -1 \
-        | grep -oP '10\.1\.1\.\d+' || true)
-      retries=$((retries + 1))
-      if [[ $retries -ge 90 ]]; then
-        warn "Could not detect IP after 90s. Check console with: qm terminal ${VMID}"
-        break
-      fi
-      sleep 1
-    done
-    if [[ -n "$vm_ip" ]]; then
-      STATIC_IP="$vm_ip"
-      ok "VM is online at ${vm_ip} (via DHCP)"
+  info "Waiting for ${STATIC_IP} to respond..."
+  local retries=0
+  while ! ping -c 1 -W 1 "$STATIC_IP" &>/dev/null; do
+    retries=$((retries + 1))
+    if [[ $retries -ge 60 ]]; then
+      warn "VM did not respond after 60s. Check console with: qm terminal ${VMID}"
+      break
     fi
-  fi
+    sleep 1
+  done
+  if [[ $retries -lt 60 ]]; then ok "VM is online at ${STATIC_IP}"; fi
 }
 
 # ── Print summary ────────────────────────────────────────────────────────────
