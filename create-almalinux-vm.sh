@@ -49,19 +49,6 @@ check_cpu_v3() {
   ok "CPU supports x86-64-v3"
 }
 
-# ── Make xterm.js the default web console (datacenter-wide) ───────────────────
-ensure_xterm_default() {
-  local cfg="/etc/pve/datacenter.cfg"
-  [[ -f "$cfg" ]] || : > "$cfg"
-  if grep -qE '^console:' "$cfg"; then
-    grep -qE '^console:[[:space:]]*xtermjs[[:space:]]*$' "$cfg" && return
-    sed -i 's/^console:.*/console: xtermjs/' "$cfg"
-  else
-    printf 'console: xtermjs\n' >> "$cfg"
-  fi
-  ok "Default web console viewer set to xterm.js"
-}
-
 # ── Get next available VMID ───────────────────────────────────────────────────
 get_next_vmid() {
   local id
@@ -386,7 +373,6 @@ print_summary() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 check_cpu_v3
 ensure_deps
-ensure_xterm_default
 download_image
 prompt_params
 create_vm
