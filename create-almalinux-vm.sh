@@ -306,7 +306,8 @@ NMEOF
     -net0 "virtio,bridge=${BRIDGE},macaddr=${mac}" \
     -onboot 1 \
     -ostype l26 \
-    -scsihw virtio-scsi-pci
+    -scsihw virtio-scsi-pci \
+    -vga serial0
 
   pvesm alloc "$STORAGE" "$VMID" "vm-${VMID}-disk-0" 4M >/dev/null
   pvesm alloc "$STORAGE" "$VMID" "vm-${VMID}-disk-2" 4M >/dev/null
