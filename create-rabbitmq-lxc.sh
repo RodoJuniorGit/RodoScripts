@@ -153,9 +153,10 @@ set -euo pipefail
 
 dnf -y update
 dnf -y install epel-release
-dnf -y install curl vim-enhanced bash-completion chrony logrotate firewalld policycoreutils-python-utils
+dnf -y install curl vim-enhanced bash-completion logrotate firewalld
 
-systemctl enable --now chronyd
+# NOTA: chrony removido - LXC unprivileged não tem CAP_SYS_TIME, herda hora do host
+# NOTA: SELinux já é gerenciado pelo Proxmox no CT
 
 # Repo RabbitMQ - usa el/9 (oficialmente compatível com EL10 conforme rabbitmq team)
 cat > /etc/yum.repos.d/rabbitmq.repo <<'REPO'
@@ -191,6 +192,10 @@ type=rpm-md
 REPO
 
 dnf -y install erlang rabbitmq-server
+
+# Verificação explícita
+command -v rabbitmqctl >/dev/null || { echo "FALHA: rabbitmqctl não encontrado após install"; exit 1; }
+command -v erl >/dev/null || { echo "FALHA: erlang não encontrado após install"; exit 1; }
 
 mkdir -p /etc/rabbitmq
 cat > /etc/rabbitmq/rabbitmq.conf <<'CONF'
